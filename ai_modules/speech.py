@@ -1,164 +1,214 @@
 """
-ai_modules/speech.py  — Fixed Vosk speech recognition
+Browser microphone -> Vosk speech recognition.
 
-Fixes vs original:
-  1. Model loaded inside start() not __init__  →  no crash at import time
-  2. socketio.emit uses  namespace="/"  explicitly  →  avoids silent no-op
-  3. Queue drained on stop()  →  no blocked thread after call ends
-  4. Language switch locks the recognizer  →  no race condition
-  5. Models stored as class-level cache  →  loaded only once across calls
+This replaces server-side sounddevice capture. In a real video intercom the
+speaker is usually on a browser/device, not beside the Flask server microphone,
+so the browser sends 16 kHz PCM chunks through Socket.IO.
 """
 
-import queue
+from __future__ import annotations
+
 import json
+import os
 import threading
-import sounddevice as sd
-from vosk import Model, KaldiRecognizer
+import time
+from pathlib import Path
+
+try:
+    from vosk import KaldiRecognizer, Model
+
+    VOSK_OK = True
+except Exception as exc:  # pragma: no cover - depends on local environment
+    KaldiRecognizer = None
+    Model = None
+    VOSK_OK = False
+    VOSK_ERROR = str(exc)
+else:
+    VOSK_ERROR = ""
 
 
-class VoskSpeechRecognizer:
+BASE_DIR = Path(__file__).resolve().parents[1]
 
-    # ── class-level model cache so we load each model only once ──
-    _model_cache: dict[str, Model] = {}
+MODEL_CANDIDATES = {
+    "en": [
+        os.getenv("VOSK_EN_PATH"),
+        BASE_DIR / "models" / "vosk-model-en-in-0.5",
+        r"C:\Users\prati\Desktop\SignLanguage_Project\speech2text\vosk-model-en-in-0.5",
+    ],
+    "hi": [
+        os.getenv("VOSK_HI_PATH"),
+        BASE_DIR / "models" / "vosk-model-small-hi-0.22",
+        r"C:\Users\prati\Desktop\SignLanguage_Project\speech2text\vosk-model-small-hi-0.22",
+    ],
+}
 
-    MODEL_PATHS = {
-        "en": "models/vosk-model-en-in-0.5",
-        "hi": "models/vosk-model-small-hi-0.22",
+SAMPLE_RATE = 16000
+_model_cache: dict[str, Model] = {}
+_sessions: dict[str, "BrowserVoskSession"] = {}
+
+
+def _model_path(lang: str) -> Path | None:
+    for candidate in MODEL_CANDIDATES.get(lang, MODEL_CANDIDATES["en"]):
+        if not candidate:
+            continue
+        path = Path(candidate)
+        if path.exists():
+            return path
+    return None
+
+
+def _load_model(lang: str) -> Model:
+    if not VOSK_OK:
+        raise RuntimeError(f"Vosk import failed: {VOSK_ERROR}")
+
+    lang = lang if lang in MODEL_CANDIDATES else "en"
+    if lang not in _model_cache:
+        path = _model_path(lang)
+        if path is None:
+            raise FileNotFoundError(
+                f"Vosk model for '{lang}' not found. Set VOSK_EN_PATH/VOSK_HI_PATH "
+                "or place the model folder inside project models/."
+            )
+        print(f"Loading Vosk {lang} model: {path}")
+        _model_cache[lang] = Model(str(path))
+        print(f"Vosk {lang} model ready.")
+    return _model_cache[lang]
+
+
+def get_status():
+    return {
+        "available": VOSK_OK,
+        "error": VOSK_ERROR,
+        "sample_rate": SAMPLE_RATE,
+        "models": {
+            "en": str(_model_path("en")) if _model_path("en") else None,
+            "hi": str(_model_path("hi")) if _model_path("hi") else None,
+        },
     }
 
-    def __init__(self, socketio):
-        self.socketio     = socketio
-        self.q            = queue.Queue()
-        self.current_lang = "en"
-        self.recognizer   = None
-        self.running      = False
-        self.stream       = None
-        self.last_text    = ""
-        self._lock        = threading.Lock()
 
-    # ─────────────── private helpers ───────────────
+class BrowserVoskSession:
+    def __init__(self, socketio, sid: str, room: str):
+        self.socketio = socketio
+        self.sid = sid
+        self.room = room
+        self.lang = "en"
+        self.recognizer = None
+        self.running = False
+        self.lock = threading.Lock()
+        self.last_text = ""
+        self.last_emit_time = 0.0
 
-    def _get_model(self, lang: str) -> Model:
-        if lang not in self._model_cache:
-            path = self.MODEL_PATHS.get(lang, self.MODEL_PATHS["en"])
-            print(f"⏳  Loading Vosk model for '{lang}' from {path} …")
-            self._model_cache[lang] = Model(path)
-            print(f"✅  Vosk model '{lang}' ready")
-        return self._model_cache[lang]
-
-    def _make_recognizer(self, lang: str) -> KaldiRecognizer:
-        model = self._get_model(lang)
-        return KaldiRecognizer(model, 16000)
-
-    # ─────────────── public API ───────────────
+    def _make_recognizer(self, lang: str):
+        model = _load_model(lang)
+        recognizer = KaldiRecognizer(model, SAMPLE_RATE)
+        recognizer.SetWords(True)
+        return recognizer
 
     def set_language(self, lang: str):
-        with self._lock:
-            if lang not in self.MODEL_PATHS:
-                print(f"⚠️  Unknown language '{lang}', defaulting to 'en'")
-                lang = "en"
-            self.current_lang = lang
-            self.recognizer   = self._make_recognizer(lang)
-        print(f"🌐  Language → {lang}")
+        if lang not in MODEL_CANDIDATES:
+            lang = "en"
+        with self.lock:
+            self.lang = lang
+            if self.running:
+                self.recognizer = self._make_recognizer(lang)
+        print(f"Speech language for {self.sid}: {lang}")
 
-    def start(self):
-        if self.running:
-            print("Speech already running")
-            return
+    def start(self, lang: str = "en") -> bool:
+        if lang not in MODEL_CANDIDATES:
+            lang = "en"
+        try:
+            with self.lock:
+                self.lang = lang
+                self.recognizer = self._make_recognizer(lang)
+                self.running = True
+                self.last_text = ""
+                self.last_emit_time = 0.0
+        except Exception as exc:
+            msg = str(exc)
+            print(f"Speech start failed for {self.sid}: {msg}")
+            self.socketio.emit(
+                "speech_error",
+                {"message": msg},
+                to=self.sid,
+                namespace="/",
+            )
+            return False
 
-        # lazy-load the default model on first start
-        with self._lock:
-            if self.recognizer is None:
-                self.recognizer = self._make_recognizer(self.current_lang)
-
-        print("🎤  Speech recognition started")
-        self.running = True
-
-        self.stream = sd.RawInputStream(
-            samplerate = 16000,
-            blocksize  = 8000,
-            dtype      = "int16",
-            channels   = 1,
-            callback   = self._audio_callback,
-        )
-        self.stream.start()
-
-        threading.Thread(target=self._process_loop, daemon=True).start()
+        print(f"Browser speech started for {self.sid} ({lang}).")
+        return True
 
     def stop(self):
-        if not self.running:
+        with self.lock:
+            self.running = False
+            self.recognizer = None
+        print(f"Browser speech stopped for {self.sid}.")
+
+    def accept_audio(self, payload):
+        if isinstance(payload, dict):
+            payload = payload.get("audio", b"")
+        if isinstance(payload, bytearray):
+            payload = bytes(payload)
+        if not isinstance(payload, bytes) or not payload:
             return
 
-        print("🛑  Speech recognition stopped")
-        self.running = False
+        with self.lock:
+            if not self.running or self.recognizer is None:
+                return
+            recognizer = self.recognizer
+            lang = self.lang
 
-        if self.stream:
-            self.stream.stop()
-            self.stream.close()
-            self.stream = None
+            accepted = recognizer.AcceptWaveform(payload)
+            if not accepted:
+                return
 
-        # drain the queue so the worker thread can exit
-        while not self.q.empty():
             try:
-                self.q.get_nowait()
-            except queue.Empty:
-                break
+                result = json.loads(recognizer.Result())
+            except Exception:
+                result = {}
 
-    # ─────────────── internal ───────────────
+        text = result.get("text", "").strip()
+        if not text:
+            return
 
-    def _audio_callback(self, indata, frames, time, status):
-        if status:
-            print("Audio status:", status)
-        if self.running:
-            self.q.put(bytes(indata))
+        now = time.time()
+        if text == self.last_text and now - self.last_emit_time < 2.0:
+            return
 
-    def _process_loop(self):
-        while self.running:
-            try:
-                data = self.q.get(timeout=1)
-            except queue.Empty:
-                continue
-
-            with self._lock:
-                rec = self.recognizer
-                lang = self.current_lang
-
-            if rec is None:
-                continue
-
-            if rec.AcceptWaveform(data):
-                result = json.loads(rec.Result())
-                text   = result.get("text", "").strip()
-
-                if text and text != self.last_text:
-                    self.last_text = text
-                    print(f"[{lang}] {text}")
-
-                    self.socketio.emit(
-                        "result",
-                        {"text": text, "type": "speech", "lang": lang},
-                        namespace="/",
-                    )
+        self.last_text = text
+        self.last_emit_time = now
+        print(f"[{lang}] {text}")
+        self.socketio.emit(
+            "result",
+            {"text": text, "type": "speech", "lang": lang},
+            room=self.room,
+            namespace="/",
+        )
 
 
-# ─────────────────────────────────────────────
-#  Module-level singleton + control functions
-# ─────────────────────────────────────────────
-_instance: VoskSpeechRecognizer | None = None
+def _session(socketio, sid: str, room: str = "intercom_room") -> BrowserVoskSession:
+    if sid not in _sessions:
+        _sessions[sid] = BrowserVoskSession(socketio, sid, room)
+    return _sessions[sid]
 
 
-def start_speech(socketio):
-    global _instance
-    if _instance is None:
-        _instance = VoskSpeechRecognizer(socketio)
-    _instance.start()
+def start_speech(socketio, sid: str, lang: str = "en", room: str = "intercom_room"):
+    return _session(socketio, sid, room).start(lang)
 
 
-def stop_speech():
-    if _instance:
-        _instance.stop()
+def stop_speech(sid: str):
+    session = _sessions.get(sid)
+    if session:
+        session.stop()
 
 
-def set_language(lang: str):
-    if _instance:
-        _instance.set_language(lang)
+def set_language(sid: str, lang: str):
+    session = _sessions.get(sid)
+    if session:
+        session.set_language(lang)
+
+
+def accept_audio(sid: str, payload):
+    session = _sessions.get(sid)
+    if session:
+        session.accept_audio(payload)

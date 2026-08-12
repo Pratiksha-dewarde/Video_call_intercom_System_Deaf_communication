@@ -19,7 +19,7 @@ detection and sends 21 landmarks to the server via socket. This module is
 provided for an ALTERNATIVE architecture where raw video frames are sent
 to the server and processed here with Python MediaPipe + TF.
 """
-c
+
 import numpy as np
 from collections import deque, Counter
 
